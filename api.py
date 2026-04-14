@@ -1,21 +1,38 @@
-from fastapi import FastAPI, HTTPException, status
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Union
+from fastapi.responses import JSONResponse
+from typing import List
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 from models import (
     CompteCreateCourant, CompteCreateEpargne, CompteCreateBloque,
     CompteUpdate, DepotRetrait, CompteResponse, MessageResponse,
     InteretsResponse, ErrorResponse
 )
-from storage import BanqueStorage
-from services import BanqueService, ServiceError
+from storage import BanqueStorage, StorageError, init_pool, close_pool
+from services import BanqueService, ServiceError  # Assure-toi que le fichier s'appelle bien service.py
+
+
+# --- LIFESPAN (Gestion du cycle de vie de l'API) ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_pool()
+    app.state.service = BanqueService(BanqueStorage())
+    yield
+    close_pool()
 
 
 app = FastAPI(
     title="API Gestion de Comptes Bancaires",
-    description="API REST pour la gestion de comptes bancaires (courant, épargne, bloqué) avec stockage JSON",
-    version="1.0.0",
-    contact={"name": "Équipe Banque", "email": "contact@banque-api.com"},
+    description="API REST pour la gestion de comptes bancaires (courant, épargne, bloqué) avec stockage PostgreSQL",
+    version="2.0.0",
+    lifespan=lifespan
 )
 
 app.add_middleware(
@@ -26,25 +43,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-storage = BanqueStorage("comptes.json")
-service = BanqueService(storage)
 
+# --- EXCEPTION HANDLER GLOBAL (Le vrai plus senior) ---
+@app.exception_handler(ServiceError)
+async def service_error_handler(request: Request, exc: ServiceError):
+    return JSONResponse(
+        status_code=exc.status_code, 
+        content={"detail": exc.message}
+    )
+
+@app.exception_handler(StorageError)
+async def storage_error_handler(request: Request, exc: StorageError):
+    return JSONResponse(
+        status_code=500, 
+        content={"detail": f"Erreur base de données : {str(exc)}"}
+    )
+
+
+# --- ROUTES RACINE ---
 
 @app.get("/", tags=["Racine"], summary="Page d'accueil de l'API")
 def racine():
     return {
         "message": "Bienvenue sur l'API Gestion de Comptes Bancaires",
         "documentation": "/docs",
-        "redoc": "/redoc",
-        "version": "1.0.0",
-        "endpoints": {
-            "comptes": "/comptes",
-            "comptes_courants": "/comptes/type/courant",
-            "comptes_epargne": "/comptes/type/epargne",
-            "comptes_bloques": "/comptes/type/bloque"
-        }
+        "version": "2.0.0"
     }
 
+
+# --- ROUTES LECTURE ---
 
 @app.get(
     "/comptes",
@@ -53,11 +80,8 @@ def racine():
     summary="Lister tous les comptes",
     description="Retourne la liste complète des comptes triés par titulaire."
 )
-def lister_comptes():
-    try:
-        return service.tous()
-    except ServiceError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def lister_comptes(request: Request):
+    return request.app.state.service.tous()
 
 
 @app.get(
@@ -66,11 +90,8 @@ def lister_comptes():
     tags=["Comptes"],
     summary="Lister les comptes courants"
 )
-def lister_courants():
-    try:
-        return service.tous_par_type("courant")
-    except ServiceError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def lister_courants(request: Request):
+    return request.app.state.service.tous_par_type("courant")
 
 
 @app.get(
@@ -79,11 +100,8 @@ def lister_courants():
     tags=["Comptes"],
     summary="Lister les comptes épargne"
 )
-def lister_epargnes():
-    try:
-        return service.tous_par_type("epargne")
-    except ServiceError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def lister_epargnes(request: Request):
+    return request.app.state.service.tous_par_type("epargne")
 
 
 @app.get(
@@ -92,11 +110,8 @@ def lister_epargnes():
     tags=["Comptes"],
     summary="Lister les comptes bloqués"
 )
-def lister_bloques():
-    try:
-        return service.tous_par_type("bloque")
-    except ServiceError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def lister_bloques(request: Request):
+    return request.app.state.service.tous_par_type("bloque")
 
 
 @app.get(
@@ -106,64 +121,49 @@ def lister_bloques():
     summary="Récupérer un compte par numéro",
     responses={404: {"model": ErrorResponse, "description": "Compte introuvable"}}
 )
-def obtenir_compte(numero: str):
-    compte = service.get_compte(numero)
-    if compte is None:
-        raise HTTPException(status_code=404, detail="Compte introuvable.")
-    return compte
+def obtenir_compte(numero: str, request: Request):
+    return request.app.state.service.get_compte(numero)
 
+
+# --- ROUTES CRÉATION ---
 
 @app.post(
     "/comptes/courant",
     response_model=CompteResponse,
-    status_code=status.HTTP_201_CREATED,
+    status_code=201,
     tags=["Création"],
     summary="Créer un compte courant",
     responses={400: {"model": ErrorResponse, "description": "Données invalides"}}
 )
-def creer_courant(compte: CompteCreateCourant):
-    try:
-        return service.creer_compte_courant(
-            compte.numero, compte.titulaire, compte.solde, compte.decouvert
-        )
-    except ServiceError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+def creer_courant(data: CompteCreateCourant, request: Request):
+    return request.app.state.service.creer_compte_courant(data)
 
 
 @app.post(
     "/comptes/epargne",
     response_model=CompteResponse,
-    status_code=status.HTTP_201_CREATED,
+    status_code=201,
     tags=["Création"],
     summary="Créer un compte épargne",
     responses={400: {"model": ErrorResponse, "description": "Données invalides"}}
 )
-def creer_epargne(compte: CompteCreateEpargne):
-    try:
-        return service.creer_compte_epargne(
-            compte.numero, compte.titulaire, compte.solde, compte.taux
-        )
-    except ServiceError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+def creer_epargne(data: CompteCreateEpargne, request: Request):
+    return request.app.state.service.creer_compte_epargne(data)
 
 
 @app.post(
     "/comptes/bloque",
     response_model=CompteResponse,
-    status_code=status.HTTP_201_CREATED,
+    status_code=201,
     tags=["Création"],
     summary="Créer un compte bloqué",
     responses={400: {"model": ErrorResponse, "description": "Données invalides"}}
 )
-def creer_bloque(compte: CompteCreateBloque):
-    try:
-        date_str = compte.date_creation.strftime("%d/%m/%Y %H:%M")
-        return service.creer_compte_bloque(
-            compte.numero, compte.titulaire, compte.solde, date_str
-        )
-    except ServiceError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+def creer_bloque(data: CompteCreateBloque, request: Request):
+    return request.app.state.service.creer_compte_bloque(data)
 
+
+# --- ROUTES OPÉRATIONS ---
 
 @app.post(
     "/comptes/{numero}/deposer",
@@ -175,13 +175,8 @@ def creer_bloque(compte: CompteCreateBloque):
         404: {"model": ErrorResponse, "description": "Compte introuvable"}
     }
 )
-def deposer(numero: str, operation: DepotRetrait):
-    try:
-        return service.deposer(numero, operation.montant)
-    except ServiceError as e:
-        if "introuvable" in str(e).lower():
-            raise HTTPException(status_code=404, detail=str(e))
-        raise HTTPException(status_code=400, detail=str(e))
+def deposer(numero: str, operation: DepotRetrait, request: Request):
+    return request.app.state.service.deposer(numero, operation.montant)
 
 
 @app.post(
@@ -194,13 +189,8 @@ def deposer(numero: str, operation: DepotRetrait):
         404: {"model": ErrorResponse, "description": "Compte introuvable"}
     }
 )
-def retirer(numero: str, operation: DepotRetrait):
-    try:
-        return service.retirer(numero, operation.montant)
-    except ServiceError as e:
-        if "introuvable" in str(e).lower():
-            raise HTTPException(status_code=404, detail=str(e))
-        raise HTTPException(status_code=400, detail=str(e))
+def retirer(numero: str, operation: DepotRetrait, request: Request):
+    return request.app.state.service.retirer(numero, operation.montant)
 
 
 @app.post(
@@ -209,17 +199,11 @@ def retirer(numero: str, operation: DepotRetrait):
     tags=["Opérations"],
     summary="Appliquer les intérêts aux comptes épargne"
 )
-def appliquer_interets():
-    try:
-        result = service.appliquer_interets()
-        return {
-            "message": "Intérêts appliqués avec succès.",
-            "total_gains": result["total_gains"],
-            "comptes_mis_a_jour": result["comptes_mis_a_jour"]
-        }
-    except ServiceError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def appliquer_interets(request: Request):
+    return request.app.state.service.appliquer_interets()
 
+
+# --- ROUTES MODIFICATION / SUPPRESSION ---
 
 @app.put(
     "/comptes/{numero}",
@@ -231,13 +215,8 @@ def appliquer_interets():
         404: {"model": ErrorResponse, "description": "Compte introuvable"}
     }
 )
-def modifier_compte(numero: str, maj: CompteUpdate):
-    try:
-        return service.modifier(numero, maj.titulaire, maj.decouvert, maj.taux)
-    except ServiceError as e:
-        if "introuvable" in str(e).lower():
-            raise HTTPException(status_code=404, detail=str(e))
-        raise HTTPException(status_code=400, detail=str(e))
+def modifier_compte(numero: str, maj: CompteUpdate, request: Request):
+    return request.app.state.service.modifier(numero, maj)
 
 
 @app.delete(
@@ -247,11 +226,6 @@ def modifier_compte(numero: str, maj: CompteUpdate):
     summary="Supprimer un compte",
     responses={404: {"model": ErrorResponse, "description": "Compte introuvable"}}
 )
-def supprimer_compte(numero: str):
-    try:
-        service.supprimer(numero)
-        return {"message": "Compte supprimé avec succès."}
-    except ServiceError as e:
-        if "introuvable" in str(e).lower():
-            raise HTTPException(status_code=404, detail=str(e))
-        raise HTTPException(status_code=400, detail=str(e))
+def supprimer_compte(numero: str, request: Request):
+    request.app.state.service.supprimer(numero)
+    return {"message": "Compte supprimé avec succès."}
