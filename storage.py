@@ -3,7 +3,7 @@ from typing import Optional, List
 from contextlib import contextmanager
 import psycopg2
 import psycopg2.extras
-from psycopg2 import pool
+from psycopg2 import pool, errors
 
 class StorageError(Exception):
     pass
@@ -21,7 +21,6 @@ def init_pool():
         user=os.environ.get("DB_USER", "postgres"),
         password=os.environ.get("DB_PASSWORD", ""),
     )
-    # Init DB au démarrage
     with _get_cursor() as cur:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS comptes (
@@ -47,6 +46,9 @@ def _get_cursor(dict_cursor=False):
         with conn.cursor(cursor_factory=cursor_factory) as cur:
             yield cur
         conn.commit()
+    except errors.UniqueViolation:
+        conn.rollback()
+        raise StorageError("Ce numéro de compte existe déjà.")  # ← géré ici, avant le except général
     except Exception as e:
         conn.rollback()
         raise StorageError(str(e))
@@ -59,23 +61,18 @@ class BanqueStorage:
         sql = """INSERT INTO comptes 
                  (numero, titulaire, solde, type, decouvert, taux, date_creation, date_deblocage)
                  VALUES (%(numero)s, %(titulaire)s, %(solde)s, %(type)s, %(decouvert)s, %(taux)s, %(date_creation)s, %(date_deblocage)s)"""
-        
         params = {
-            "numero": compte.get("numero"),
-            "titulaire": compte.get("titulaire"),
-            "solde": compte.get("solde"),
-            "type": compte.get("type"),
-            "decouvert": compte.get("decouvert"),
-            "taux": compte.get("taux"),
-            "date_creation": compte.get("date_creation"),
+            "numero":         compte.get("numero"),
+            "titulaire":      compte.get("titulaire"),
+            "solde":          compte.get("solde"),
+            "type":           compte.get("type"),
+            "decouvert":      compte.get("decouvert"),
+            "taux":           compte.get("taux"),
+            "date_creation":  compte.get("date_creation"),
             "date_deblocage": compte.get("date_deblocage"),
         }
-        
-        try:
-            with _get_cursor() as cur:
-                cur.execute(sql, params)
-        except psycopg2.errors.UniqueViolation:
-            raise StorageError("Ce numéro de compte existe déjà.")
+        with _get_cursor() as cur:
+            cur.execute(sql, params)
 
     def get(self, numero: str) -> Optional[dict]:
         with _get_cursor(dict_cursor=True) as cur:
@@ -83,10 +80,14 @@ class BanqueStorage:
             return cur.fetchone()
 
     def maj(self, numero: str, champs: dict) -> Optional[dict]:
-        if not champs: return self.get(numero)
+        if not champs:
+            return self.get(numero)
         colonnes = ", ".join(f"{k} = %({k})s" for k in champs)
         with _get_cursor(dict_cursor=True) as cur:
-            cur.execute(f"UPDATE comptes SET {colonnes} WHERE numero = %(numero)s RETURNING *", {**champs, "numero": numero})
+            cur.execute(
+                f"UPDATE comptes SET {colonnes} WHERE numero = %(numero)s RETURNING *",
+                {**champs, "numero": numero}
+            )
             return cur.fetchone()
 
     def supprimer(self, numero: str) -> bool:
